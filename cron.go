@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -83,11 +84,54 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
+// recoveryTimeLimit bounds how late a freshly-registered entry's natural next
+// tick (i.e. Schedule.Next(Prev)) can already be, in ScheduleFirst, before it
+// is fired almost immediately instead of being silently rolled forward to its
+// next scheduled occurrence.
+//
+// This is zero (disabled) by default, which preserves this library's original
+// behavior for every existing consumer. Set RETL_RECOVERY_TIME_LIMIT to a
+// duration string accepted by time.ParseDuration (e.g. "20m") to opt in.
+//
+// Background: ScheduleFirst calls Schedule.NextWithAfter(Prev, now), and
+// NextWithAfter starts its search from whichever of its two arguments is
+// later. Since `now` is virtually always later than `Prev`, the search
+// effectively always starts from `now` - so if the entry's natural next tick
+// (computed from Prev) already passed by the time it's (re-)registered, it is
+// silently skipped in favor of the following occurrence, with no error and no
+// signal that anything was missed. This is most likely to bite right after a
+// process restart, when every entry has to be freshly re-registered at once.
+var recoveryTimeLimit = parseRecoveryTimeLimit()
+
+// recoveryFireDelay is how soon a recovered entry (one whose natural next
+// tick was found to be overdue, but within recoveryTimeLimit) is scheduled to
+// fire once RETL_RECOVERY_TIME_LIMIT is set.
+const recoveryFireDelay = 30 * time.Second
+
+func parseRecoveryTimeLimit() time.Duration {
+	v := os.Getenv("RETL_RECOVERY_TIME_LIMIT")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 // ScheduleFirst is used for the initial scheduling. If a Prev value has been
 // included with the Entry, it will be used in place of "now" to allow schedules
 // to be preserved across process restarts.
 func (e Entry) ScheduleFirst(now time.Time) time.Time {
 	if !e.Prev.IsZero() {
+		if recoveryTimeLimit > 0 {
+			if naturalNext := e.Schedule.Next(e.Prev); !naturalNext.IsZero() &&
+				naturalNext.Before(now) &&
+				now.Sub(naturalNext) <= recoveryTimeLimit {
+				return now.Add(recoveryFireDelay)
+			}
+		}
 		return e.Schedule.NextWithAfter(e.Prev, now)
 	} else {
 		return e.Schedule.NextWithAfter(now, time.Time{})
