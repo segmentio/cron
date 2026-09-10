@@ -36,6 +36,15 @@ func withRecoveryTimeLimit(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { recoveryTimeLimit = old })
 }
 
+// withRecoveryObserver installs fn as RecoveryObserver for the duration of
+// the test and restores whatever was there before on cleanup.
+func withRecoveryObserver(t *testing.T, fn func(refID string, recovered bool, naturalNext, now time.Time)) {
+	t.Helper()
+	old := RecoveryObserver
+	RecoveryObserver = fn
+	t.Cleanup(func() { RecoveryObserver = old })
+}
+
 // A job's natural next tick passed recently (within recoveryTimeLimit) by the
 // time it's (re-)registered - e.g. right after a process restart. With
 // recovery enabled, it should be scheduled to fire almost immediately instead
@@ -78,7 +87,7 @@ func TestScheduleFirstLeavesOldMissesAlone(t *testing.T) {
 
 // With recovery disabled (the default, zero value), ScheduleFirst's behavior
 // is byte-for-byte unchanged from before this change, for any consumer that
-// doesn't opt in via RETL_RECOVERY_TIME_LIMIT.
+// doesn't opt in via RECOVERY_TIME_LIMIT.
 func TestScheduleFirstDisabledByDefault(t *testing.T) {
 	withRecoveryTimeLimit(t, 0)
 
@@ -107,10 +116,90 @@ func TestParseRecoveryTimeLimit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("RETL_RECOVERY_TIME_LIMIT", tt.env)
+			t.Setenv("RECOVERY_TIME_LIMIT", tt.env)
 			if got := parseRecoveryTimeLimit(); got != tt.want {
 				t.Errorf("parseRecoveryTimeLimit() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// RecoveryObserver should fire with recovered=true, carrying the entry's
+// RefID, when a recent miss is recovered.
+func TestRecoveryObserverCalledOnRecovery(t *testing.T) {
+	withRecoveryTimeLimit(t, 20*time.Minute)
+
+	var gotRefID string
+	var gotRecovered bool
+	var callCount int
+	withRecoveryObserver(t, func(refID string, recovered bool, naturalNext, now time.Time) {
+		callCount++
+		gotRefID = refID
+		gotRecovered = recovered
+	})
+
+	now := time.Now()
+	naturalNext := now.Add(-5 * time.Minute)
+	prev := naturalNext.Add(-24 * time.Hour)
+
+	entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev, RefID: "retl:src-1:sub-1"}
+	entry.ScheduleFirst(now)
+
+	if callCount != 1 {
+		t.Fatalf("RecoveryObserver called %d times, want 1", callCount)
+	}
+	if !gotRecovered {
+		t.Error("RecoveryObserver recovered = false, want true")
+	}
+	if gotRefID != "retl:src-1:sub-1" {
+		t.Errorf("RecoveryObserver refID = %q, want %q", gotRefID, "retl:src-1:sub-1")
+	}
+}
+
+// RecoveryObserver should also fire with recovered=false for a miss beyond
+// recoveryTimeLimit, so callers can alert on unrecovered misses too.
+func TestRecoveryObserverCalledOnUnrecoveredMiss(t *testing.T) {
+	withRecoveryTimeLimit(t, 20*time.Minute)
+
+	var gotRecovered bool
+	var callCount int
+	withRecoveryObserver(t, func(refID string, recovered bool, naturalNext, now time.Time) {
+		callCount++
+		gotRecovered = recovered
+	})
+
+	now := time.Now()
+	naturalNext := now.Add(-30 * time.Minute) // beyond the 20m limit
+	prev := naturalNext.Add(-24 * time.Hour)
+
+	entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev, RefID: "retl:src-2:sub-2"}
+	entry.ScheduleFirst(now)
+
+	if callCount != 1 {
+		t.Fatalf("RecoveryObserver called %d times, want 1", callCount)
+	}
+	if gotRecovered {
+		t.Error("RecoveryObserver recovered = true, want false")
+	}
+}
+
+// RecoveryObserver should not be called at all when there's no miss.
+func TestRecoveryObserverNotCalledWhenNotDue(t *testing.T) {
+	withRecoveryTimeLimit(t, 20*time.Minute)
+
+	var callCount int
+	withRecoveryObserver(t, func(refID string, recovered bool, naturalNext, now time.Time) {
+		callCount++
+	})
+
+	now := time.Now()
+	naturalNext := now.Add(1 * time.Hour) // not due yet
+	prev := naturalNext.Add(-24 * time.Hour)
+
+	entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev}
+	entry.ScheduleFirst(now)
+
+	if callCount != 0 {
+		t.Errorf("RecoveryObserver called %d times, want 0", callCount)
 	}
 }
