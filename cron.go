@@ -72,6 +72,13 @@ type Entry struct {
 	// AdHocInvokedTime will record the invocation time of manually triggered job runs.
 	AdHocInvokedTime time.Time
 
+	// RefID is an opaque, caller-supplied identifier for this entry (set via
+	// WithRefID), passed through to RecoveryObserver so callers can tag their
+	// own metrics/logs with whatever identifies this job in their system
+	// (e.g. "retl:<source_id>:<subscription_id>"). This package never
+	// interprets it.
+	RefID string
+
 	// WrappedJob is the thing to run when the Schedule is activated.
 	WrappedJob Job
 
@@ -90,8 +97,8 @@ func (e Entry) Valid() bool { return e.ID != 0 }
 // next scheduled occurrence.
 //
 // This is zero (disabled) by default, which preserves this library's original
-// behavior for every existing consumer. Set RETL_RECOVERY_TIME_LIMIT to a
-// duration string accepted by time.ParseDuration (e.g. "20m") to opt in.
+// behavior for every existing consumer. Set RECOVERY_TIME_LIMIT to a duration
+// string accepted by time.ParseDuration (e.g. "20m") to opt in.
 //
 // Background: ScheduleFirst calls Schedule.NextWithAfter(Prev, now), and
 // NextWithAfter starts its search from whichever of its two arguments is
@@ -105,11 +112,11 @@ var recoveryTimeLimit = parseRecoveryTimeLimit()
 
 // recoveryFireDelay is how soon a recovered entry (one whose natural next
 // tick was found to be overdue, but within recoveryTimeLimit) is scheduled to
-// fire once RETL_RECOVERY_TIME_LIMIT is set.
+// fire once RECOVERY_TIME_LIMIT is set.
 const recoveryFireDelay = 30 * time.Second
 
 func parseRecoveryTimeLimit() time.Duration {
-	v := os.Getenv("RETL_RECOVERY_TIME_LIMIT")
+	v := os.Getenv("RECOVERY_TIME_LIMIT")
 	if v == "" {
 		return 0
 	}
@@ -120,16 +127,37 @@ func parseRecoveryTimeLimit() time.Duration {
 	return d
 }
 
+// RecoveryObserver, when set, is called by ScheduleFirst whenever a
+// re-registered entry's natural next tick (Schedule.Next(Prev)) is found to
+// already be overdue - only once RECOVERY_TIME_LIMIT is set, since that's
+// what makes this check run at all. recovered is true if the miss was within
+// RECOVERY_TIME_LIMIT (so the entry was scheduled to fire almost
+// immediately), false if it was older (so it was left to roll forward to its
+// next occurrence as usual, same as this package's original behavior).
+//
+// refID is whatever the caller attached to the entry via WithRefID - this
+// package never interprets it, it's just plumbed through so a caller can
+// tag their own metric/log with it (e.g. a source/subscription identifier)
+// without this package needing to know what that means.
+//
+// Nil by default (no-op). Not safe to reassign concurrently with a running
+// Cron; set it once during startup before adding jobs.
+var RecoveryObserver func(refID string, recovered bool, naturalNext, now time.Time)
+
 // ScheduleFirst is used for the initial scheduling. If a Prev value has been
 // included with the Entry, it will be used in place of "now" to allow schedules
 // to be preserved across process restarts.
 func (e Entry) ScheduleFirst(now time.Time) time.Time {
 	if !e.Prev.IsZero() {
 		if recoveryTimeLimit > 0 {
-			if naturalNext := e.Schedule.Next(e.Prev); !naturalNext.IsZero() &&
-				naturalNext.Before(now) &&
-				now.Sub(naturalNext) <= recoveryTimeLimit {
-				return now.Add(recoveryFireDelay)
+			if naturalNext := e.Schedule.Next(e.Prev); !naturalNext.IsZero() && naturalNext.Before(now) {
+				recovered := now.Sub(naturalNext) <= recoveryTimeLimit
+				if RecoveryObserver != nil {
+					RecoveryObserver(e.RefID, recovered, naturalNext, now)
+				}
+				if recovered {
+					return now.Add(recoveryFireDelay)
+				}
 			}
 		}
 		return e.Schedule.NextWithAfter(e.Prev, now)
@@ -248,6 +276,16 @@ type EntryOption func(*Entry)
 func WithPrev(prev time.Time) EntryOption {
 	return func(e *Entry) {
 		e.Prev = prev
+	}
+}
+
+// WithRefID attaches an opaque, caller-defined identifier to an entry. It has
+// no effect on scheduling; it exists purely so RecoveryObserver can report
+// which entry a recovered or unrecovered miss belongs to, in whatever form
+// the caller finds useful (e.g. "retl:<source_id>:<subscription_id>").
+func WithRefID(id string) EntryOption {
+	return func(e *Entry) {
+		e.RefID = id
 	}
 }
 
