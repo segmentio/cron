@@ -148,22 +148,39 @@ var RecoveryObserver func(refID string, recovered bool, naturalNext, now time.Ti
 // included with the Entry, it will be used in place of "now" to allow schedules
 // to be preserved across process restarts.
 func (e Entry) ScheduleFirst(now time.Time) time.Time {
-	if !e.Prev.IsZero() {
-		if recoveryTimeLimit > 0 {
-			if naturalNext := e.Schedule.Next(e.Prev); !naturalNext.IsZero() && naturalNext.Before(now) {
-				recovered := now.Sub(naturalNext) <= recoveryTimeLimit
-				if RecoveryObserver != nil {
-					RecoveryObserver(e.RefID, recovered, naturalNext, now)
-				}
-				if recovered {
-					return now.Add(recoveryFireDelay)
-				}
-			}
-		}
-		return e.Schedule.NextWithAfter(e.Prev, now)
-	} else {
+	if e.Prev.IsZero() {
 		return e.Schedule.NextWithAfter(now, time.Time{})
 	}
+	if fireAt, ok := e.recoveryFireTime(now); ok {
+		return fireAt
+	}
+	return e.Schedule.NextWithAfter(e.Prev, now)
+}
+
+// recoveryFireTime reports whether e's natural next tick (Schedule.Next(Prev))
+// has already passed by now, and if so notifies RecoveryObserver and, when the
+// miss is within recoveryTimeLimit, returns the almost-immediate time it
+// should fire at instead of being silently rolled forward by NextWithAfter.
+// ok is false - leaving ScheduleFirst to its original NextWithAfter behavior -
+// whenever recovery is disabled, there's no miss, or the miss is too old to
+// recover.
+func (e Entry) recoveryFireTime(now time.Time) (fireAt time.Time, ok bool) {
+	if recoveryTimeLimit <= 0 {
+		return time.Time{}, false
+	}
+	naturalNext := e.Schedule.Next(e.Prev)
+	if naturalNext.IsZero() || !naturalNext.Before(now) {
+		return time.Time{}, false
+	}
+
+	recovered := now.Sub(naturalNext) <= recoveryTimeLimit
+	if RecoveryObserver != nil {
+		RecoveryObserver(e.RefID, recovered, naturalNext, now)
+	}
+	if !recovered {
+		return time.Time{}, false
+	}
+	return now.Add(recoveryFireDelay), true
 }
 
 // byTime is a wrapper for sorting the entry array by time
