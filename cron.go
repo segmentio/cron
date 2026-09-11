@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -71,6 +72,13 @@ type Entry struct {
 	// AdHocInvokedTime will record the invocation time of manually triggered job runs.
 	AdHocInvokedTime time.Time
 
+	// RefID is an opaque, caller-supplied identifier for this entry (set via
+	// WithRefID), passed through to RecoveryObserver so callers can tag their
+	// own metrics/logs with whatever identifies this job in their system
+	// (e.g. "retl:<source_id>:<subscription_id>"). This package never
+	// interprets it.
+	RefID string
+
 	// WrappedJob is the thing to run when the Schedule is activated.
 	WrappedJob Job
 
@@ -83,15 +91,96 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
+// recoveryTimeLimit bounds how late a freshly-registered entry's natural next
+// tick (i.e. Schedule.Next(Prev)) can already be, in ScheduleFirst, before it
+// is fired almost immediately instead of being silently rolled forward to its
+// next scheduled occurrence.
+//
+// This is zero (disabled) by default, which preserves this library's original
+// behavior for every existing consumer. Set RECOVERY_TIME_LIMIT to a duration
+// string accepted by time.ParseDuration (e.g. "20m") to opt in.
+//
+// Background: ScheduleFirst calls Schedule.NextWithAfter(Prev, now), and
+// NextWithAfter starts its search from whichever of its two arguments is
+// later. Since `now` is virtually always later than `Prev`, the search
+// effectively always starts from `now` - so if the entry's natural next tick
+// (computed from Prev) already passed by the time it's (re-)registered, it is
+// silently skipped in favor of the following occurrence, with no error and no
+// signal that anything was missed. This is most likely to bite right after a
+// process restart, when every entry has to be freshly re-registered at once.
+var recoveryTimeLimit = parseRecoveryTimeLimit()
+
+// recoveryFireDelay is how soon a recovered entry (one whose natural next
+// tick was found to be overdue, but within recoveryTimeLimit) is scheduled to
+// fire once RECOVERY_TIME_LIMIT is set.
+const recoveryFireDelay = 30 * time.Second
+
+func parseRecoveryTimeLimit() time.Duration {
+	v := os.Getenv("RECOVERY_TIME_LIMIT")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// RecoveryObserver, when set, is called by ScheduleFirst whenever a
+// re-registered entry's natural next tick (Schedule.Next(Prev)) is found to
+// already be overdue - only once RECOVERY_TIME_LIMIT is set, since that's
+// what makes this check run at all. recovered is true if the miss was within
+// RECOVERY_TIME_LIMIT (so the entry was scheduled to fire almost
+// immediately), false if it was older (so it was left to roll forward to its
+// next occurrence as usual, same as this package's original behavior).
+//
+// refID is whatever the caller attached to the entry via WithRefID - this
+// package never interprets it, it's just plumbed through so a caller can
+// tag their own metric/log with it (e.g. a source/subscription identifier)
+// without this package needing to know what that means.
+//
+// Nil by default (no-op). Not safe to reassign concurrently with a running
+// Cron; set it once during startup before adding jobs.
+var RecoveryObserver func(refID string, recovered bool, naturalNext, now time.Time)
+
 // ScheduleFirst is used for the initial scheduling. If a Prev value has been
 // included with the Entry, it will be used in place of "now" to allow schedules
 // to be preserved across process restarts.
 func (e Entry) ScheduleFirst(now time.Time) time.Time {
-	if !e.Prev.IsZero() {
-		return e.Schedule.NextWithAfter(e.Prev, now)
-	} else {
+	if e.Prev.IsZero() {
 		return e.Schedule.NextWithAfter(now, time.Time{})
 	}
+	if fireAt, ok := e.recoveryFireTime(now); ok {
+		return fireAt
+	}
+	return e.Schedule.NextWithAfter(e.Prev, now)
+}
+
+// recoveryFireTime reports whether e's natural next tick (Schedule.Next(Prev))
+// has already passed by now, and if so notifies RecoveryObserver and, when the
+// miss is within recoveryTimeLimit, returns the almost-immediate time it
+// should fire at instead of being silently rolled forward by NextWithAfter.
+// ok is false - leaving ScheduleFirst to its original NextWithAfter behavior -
+// whenever recovery is disabled, there's no miss, or the miss is too old to
+// recover.
+func (e Entry) recoveryFireTime(now time.Time) (fireAt time.Time, ok bool) {
+	if recoveryTimeLimit <= 0 {
+		return time.Time{}, false
+	}
+	naturalNext := e.Schedule.Next(e.Prev)
+	if naturalNext.IsZero() || !naturalNext.Before(now) {
+		return time.Time{}, false
+	}
+
+	recovered := now.Sub(naturalNext) <= recoveryTimeLimit
+	if RecoveryObserver != nil {
+		RecoveryObserver(e.RefID, recovered, naturalNext, now)
+	}
+	if !recovered {
+		return time.Time{}, false
+	}
+	return now.Add(recoveryFireDelay), true
 }
 
 // byTime is a wrapper for sorting the entry array by time
@@ -204,6 +293,16 @@ type EntryOption func(*Entry)
 func WithPrev(prev time.Time) EntryOption {
 	return func(e *Entry) {
 		e.Prev = prev
+	}
+}
+
+// WithRefID attaches an opaque, caller-defined identifier to an entry. It has
+// no effect on scheduling; it exists purely so RecoveryObserver can report
+// which entry a recovered or unrecovered miss belongs to, in whatever form
+// the caller finds useful (e.g. "retl:<source_id>:<subscription_id>").
+func WithRefID(id string) EntryOption {
+	return func(e *Entry) {
+		e.RefID = id
 	}
 }
 
