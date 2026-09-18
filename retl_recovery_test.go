@@ -58,10 +58,72 @@ func TestScheduleFirstRecoversRecentMiss(t *testing.T) {
 
 	entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev}
 
+	// Fires after recoveryFireDelay, plus a per-entry jitter offset that
+	// spreads a mass recovery out rather than firing everything at once.
 	got := entry.ScheduleFirst(now)
-	want := now.Add(recoveryFireDelay)
-	if !got.Equal(want) {
-		t.Errorf("ScheduleFirst() = %v, want %v (recovered fire time)", got, want)
+	earliest := now.Add(recoveryFireDelay)
+	latest := now.Add(recoveryFireDelay + recoveryFireJitter)
+	if got.Before(earliest) || !got.Before(latest) {
+		t.Errorf("ScheduleFirst() = %v, want within [%v, %v)", got, earliest, latest)
+	}
+}
+
+// A restart that recovers many entries at once must not schedule them all for
+// the same instant - each entry's fire time is offset by a jitter derived from
+// its own identity.
+func TestRecoveryJitterSpreadsEntries(t *testing.T) {
+	withRecoveryTimeLimit(t, 20*time.Minute)
+
+	now := time.Now()
+	naturalNext := now.Add(-5 * time.Minute)
+	prev := naturalNext.Add(-24 * time.Hour)
+
+	fireTimes := make(map[time.Time]int)
+	for _, refID := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev, RefID: refID}
+		fireTimes[entry.ScheduleFirst(now)]++
+	}
+
+	// Not asserting all 8 are unique (hash collisions are legal), just that
+	// they don't all collapse onto one instant the way a fixed delay would.
+	if len(fireTimes) < 2 {
+		t.Errorf("all %d entries scheduled for the same instant, want them spread", len(fireTimes))
+	}
+}
+
+// Jitter must be stable for a given entry, so a job doesn't drift to a
+// different offset on every restart.
+func TestRecoveryJitterIsStableForSameRefID(t *testing.T) {
+	a := Entry{RefID: "retl:src-1:sub-1"}.recoveryJitter()
+	b := Entry{RefID: "retl:src-1:sub-1"}.recoveryJitter()
+	if a != b {
+		t.Errorf("recoveryJitter() = %v then %v, want stable for the same RefID", a, b)
+	}
+	if a < 0 || a >= recoveryFireJitter {
+		t.Errorf("recoveryJitter() = %v, want within [0, %v)", a, recoveryFireJitter)
+	}
+}
+
+// RecoveryObserver is caller-supplied but runs on the scheduler's goroutine,
+// which nothing else recovers - a panic in it must not escape and take the
+// whole scheduler down with it.
+func TestRecoveryObserverPanicDoesNotEscape(t *testing.T) {
+	withRecoveryTimeLimit(t, 20*time.Minute)
+	withRecoveryObserver(t, func(refID string, recovered bool, naturalNext, now time.Time) {
+		panic("observer blew up")
+	})
+
+	now := time.Now()
+	naturalNext := now.Add(-5 * time.Minute)
+	prev := naturalNext.Add(-24 * time.Hour)
+
+	entry := Entry{Schedule: fakeSchedule{next: naturalNext}, Prev: prev, RefID: "retl:src-1:sub-1"}
+
+	// Must still return a recovered fire time - the panic is contained, not
+	// allowed to abort the scheduling decision.
+	got := entry.ScheduleFirst(now)
+	if !got.After(now) {
+		t.Errorf("ScheduleFirst() = %v, want a future fire time despite the panicking observer", got)
 	}
 }
 

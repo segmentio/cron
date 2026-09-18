@@ -2,6 +2,9 @@ package cron
 
 import (
 	"context"
+	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"sort"
 	"sync"
@@ -91,57 +94,41 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
-// recoveryTimeLimit bounds how late a freshly-registered entry's natural next
-// tick (i.e. Schedule.Next(Prev)) can already be, in ScheduleFirst, before it
-// is fired almost immediately instead of being silently rolled forward to its
-// next scheduled occurrence.
+// recoveryTimeLimit bounds how late a re-registered entry's natural next tick
+// (Schedule.Next(Prev)) may already be before ScheduleFirst fires it soon
+// instead of rolling it forward to the next occurrence.
 //
-// This is zero (disabled) by default, which preserves this library's original
-// behavior for every existing consumer. Set RECOVERY_TIME_LIMIT to a duration
-// string accepted by time.ParseDuration (e.g. "20m") to opt in.
+// Zero (disabled) by default, preserving this package's original behavior.
+// Set RECOVERY_TIME_LIMIT (e.g. "15m") to opt in.
 //
-// Background: ScheduleFirst calls Schedule.NextWithAfter(Prev, now), and
-// NextWithAfter starts its search from whichever of its two arguments is
-// later. Since `now` is virtually always later than `Prev`, the search
-// effectively always starts from `now` - so if the entry's natural next tick
-// (computed from Prev) already passed by the time it's (re-)registered, it is
-// silently skipped in favor of the following occurrence, with no error and no
-// signal that anything was missed. This is most likely to bite right after a
-// process restart, when every entry has to be freshly re-registered at once.
+// Why: ScheduleFirst searches from whichever of Prev/now is later, so a tick
+// that came due while the entry was unregistered - typically a process
+// restart - is skipped with no error and no signal that anything was missed.
 var recoveryTimeLimit = parseRecoveryTimeLimit()
 
-// recoveryFireDelay is how soon a recovered entry (one whose natural next
-// tick was found to be overdue, but within recoveryTimeLimit) is scheduled to
-// fire once RECOVERY_TIME_LIMIT is set.
-const recoveryFireDelay = 30 * time.Second
+// Recovered entries fire after recoveryFireDelay, spread across
+// recoveryFireJitter so a restart recovering many entries at once doesn't
+// fire them all at the same instant.
+const (
+	recoveryFireDelay  = 30 * time.Second
+	recoveryFireJitter = 60 * time.Second
+)
 
 func parseRecoveryTimeLimit() time.Duration {
-	v := os.Getenv("RECOVERY_TIME_LIMIT")
-	if v == "" {
-		return 0
-	}
-	d, err := time.ParseDuration(v)
+	d, err := time.ParseDuration(os.Getenv("RECOVERY_TIME_LIMIT"))
 	if err != nil {
 		return 0
 	}
 	return d
 }
 
-// RecoveryObserver, when set, is called by ScheduleFirst whenever a
-// re-registered entry's natural next tick (Schedule.Next(Prev)) is found to
-// already be overdue - only once RECOVERY_TIME_LIMIT is set, since that's
-// what makes this check run at all. recovered is true if the miss was within
-// RECOVERY_TIME_LIMIT (so the entry was scheduled to fire almost
-// immediately), false if it was older (so it was left to roll forward to its
-// next occurrence as usual, same as this package's original behavior).
+// RecoveryObserver, when set, is called whenever a re-registered entry is
+// found to have missed its natural next tick. recovered reports whether the
+// miss was within recoveryTimeLimit (so the entry will fire soon) rather than
+// left to roll forward. refID is whatever the caller attached via WithRefID;
+// this package never interprets it.
 //
-// refID is whatever the caller attached to the entry via WithRefID - this
-// package never interprets it, it's just plumbed through so a caller can
-// tag their own metric/log with it (e.g. a source/subscription identifier)
-// without this package needing to know what that means.
-//
-// Nil by default (no-op). Not safe to reassign concurrently with a running
-// Cron; set it once during startup before adding jobs.
+// Nil by default. Set it once at startup, before starting a Cron.
 var RecoveryObserver func(refID string, recovered bool, naturalNext, now time.Time)
 
 // ScheduleFirst is used for the initial scheduling. If a Prev value has been
@@ -159,11 +146,10 @@ func (e Entry) ScheduleFirst(now time.Time) time.Time {
 
 // recoveryFireTime reports whether e's natural next tick (Schedule.Next(Prev))
 // has already passed by now, and if so notifies RecoveryObserver and, when the
-// miss is within recoveryTimeLimit, returns the almost-immediate time it
-// should fire at instead of being silently rolled forward by NextWithAfter.
-// ok is false - leaving ScheduleFirst to its original NextWithAfter behavior -
-// whenever recovery is disabled, there's no miss, or the miss is too old to
-// recover.
+// miss is within recoveryTimeLimit, returns the soon-ish time it should fire
+// at instead of being rolled forward by NextWithAfter. ok is false - leaving
+// ScheduleFirst to its original behavior - whenever recovery is disabled,
+// there's no miss, or the miss is too old to recover.
 func (e Entry) recoveryFireTime(now time.Time) (fireAt time.Time, ok bool) {
 	if recoveryTimeLimit <= 0 {
 		return time.Time{}, false
@@ -174,13 +160,46 @@ func (e Entry) recoveryFireTime(now time.Time) (fireAt time.Time, ok bool) {
 	}
 
 	recovered := now.Sub(naturalNext) <= recoveryTimeLimit
-	if RecoveryObserver != nil {
-		RecoveryObserver(e.RefID, recovered, naturalNext, now)
-	}
+	e.notifyRecovery(recovered, naturalNext, now)
 	if !recovered {
 		return time.Time{}, false
 	}
-	return now.Add(recoveryFireDelay), true
+	return now.Add(recoveryFireDelay + e.recoveryJitter()), true
+}
+
+// notifyRecovery calls RecoveryObserver, containing any panic it raises. The
+// observer is caller-supplied but runs on run()'s goroutine, which nothing
+// else recovers - an unguarded panic there would take down the whole
+// scheduler, not just this entry.
+func (e Entry) notifyRecovery(recovered bool, naturalNext, now time.Time) {
+	observer := RecoveryObserver
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err, isErr := r.(error)
+			if !isErr {
+				err = fmt.Errorf("%v", r)
+			}
+			DefaultLogger.Error(err, "recovery observer panicked", "entry", e.ID, "refID", e.RefID)
+		}
+	}()
+	observer(e.RefID, recovered, naturalNext, now)
+}
+
+// recoveryJitter spreads recovered entries across recoveryFireJitter, derived
+// from the entry's own identity so it stays stable across restarts rather than
+// reshuffling every time.
+func (e Entry) recoveryJitter() time.Duration {
+	h := fnv.New32a()
+	if e.RefID != "" {
+		io.WriteString(h, e.RefID)
+	} else {
+		fmt.Fprintf(h, "entry-%d", e.ID)
+	}
+	// Modulo in milliseconds: recoveryFireJitter in nanoseconds overflows uint32.
+	return time.Duration(h.Sum32()%uint32(recoveryFireJitter/time.Millisecond)) * time.Millisecond
 }
 
 // byTime is a wrapper for sorting the entry array by time
